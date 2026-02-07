@@ -9,7 +9,6 @@ import sys
 PORT = 8000
 MAX_ORDER = 9
 TOTAL_MEMORY = 512 # 2^9
-PAGE_SIZE = 1 # Start with smallest unit as page for simplicity in visualization, but let's say Order 0 is a Page.
 
 # --- Enhanced Buddy System Logic ---
 
@@ -59,9 +58,6 @@ class BuddyAllocator:
         return sorted_blocks
 
     def allocate(self, size, slab_owner=None):
-        # self.logs = [] # Don't clear logs here if called by Slab, as we want to preserve Slab logs too.
-        # But for direct calls we might want to. Let's append to logs.
-        
         if size <= 0: return None
         
         req_order = 0
@@ -116,7 +112,6 @@ class BuddyAllocator:
         
         while current_order < self.max_order:
             buddy_pfn = pfn ^ (1 << current_order)
-            # self.log(f"[Buddy] Checking Buddy: {pfn} XOR (1<<{current_order}) = {buddy_pfn}")
             
             if (buddy_pfn in self.blocks and 
                 self.blocks[buddy_pfn].is_free and 
@@ -143,28 +138,47 @@ class BuddyAllocator:
         
         return True
 
-# --- Slab Allocator Logic ---
+# --- Slub Allocator Logic (Modern Linux) ---
 
-class Slab:
+class SlubPage:
     def __init__(self, pfn, size, object_size):
         self.pfn = pfn
         self.size = size # Page size (from Buddy)
         self.object_size = object_size
         self.capacity = size // object_size
-        self.objects = [True] * self.capacity # True = Free, False = Used
+        
+        # Embedded Free List Logic
+        # Instead of a boolean array, we use a 'free_head' index
+        # and each free object contains the index of the next free object.
+        self.free_head = 0
+        self.objects = []
+        for i in range(self.capacity):
+            # Each object points to the next one. Last one points to None (-1)
+            next_idx = i + 1 if i < self.capacity - 1 else -1
+            self.objects.append(next_idx) 
+            
         self.used_count = 0
     
     def allocate(self):
-        if self.used_count >= self.capacity:
-            return None
+        if self.free_head == -1:
+            return None # Page full
         
-        for i, is_free in enumerate(self.objects):
-            if is_free:
-                self.objects[i] = False
-                self.used_count += 1
-                # Return logical address: PFN + offset
-                return self.pfn + (i * self.object_size)
-        return None
+        # Take object at head
+        obj_idx = self.free_head
+        
+        # Move head to next
+        self.free_head = self.objects[obj_idx]
+        
+        # Mark object as used (for visualization, we can use a special value like -2)
+        # But in real Slub, the value is overwritten by object data.
+        # Here we keep track of "used" state separately OR use a special sentinel.
+        # Let's use -2 to indicate USED, but we don't strictly need to track it
+        # because the 'free_head' pointer logic is enough.
+        # However, for visualization, knowing which are used is helpful.
+        self.objects[obj_idx] = -2 # Used
+        
+        self.used_count += 1
+        return self.pfn + (obj_idx * self.object_size)
 
     def deallocate(self, address):
         offset = address - self.pfn
@@ -172,11 +186,18 @@ class Slab:
             return False
         
         index = offset // self.object_size
-        if not self.objects[index]: # If used
-            self.objects[index] = True
-            self.used_count -= 1
-            return True
-        return False
+        
+        # Double free check (simplified)
+        if self.objects[index] != -2:
+            return False # Already free
+            
+        # Insert at head of free list
+        old_head = self.free_head
+        self.objects[index] = old_head
+        self.free_head = index
+        
+        self.used_count -= 1
+        return True
     
     def is_empty(self):
         return self.used_count == 0
@@ -186,57 +207,55 @@ class Slab:
             "pfn": self.pfn,
             "total_slots": self.capacity,
             "used_slots": self.used_count,
-            "slots": self.objects # Array of booleans
+            "free_head": self.free_head,
+            "slots": self.objects # Array of indices (Next Ptr) or -2 (Used)
         }
 
-class SlabCache:
+class SlubCache:
     def __init__(self, name, object_size, buddy_allocator):
         self.name = name
         self.object_size = object_size
         self.buddy = buddy_allocator
-        self.slabs = [] # List of Slab objects
-        # We assume 1 Page (Order 0, size 1 here is too small? Let's say Order 4 = 16 units is a page)
-        # For this demo, let's say a "Page" requested from Buddy is dynamically determined.
-        # Let's say we request a block big enough to hold at least 4 objects.
-        self.page_order = max(0, (object_size * 4 - 1).bit_length()) 
-        # Or simpler: Fixed "Page" size? 
-        # Let's stick to requesting a block of size e.g. 32 (Order 5) for smaller objects.
-        self.page_order = 5 # Size 32
-        if object_size > 16: self.page_order = (object_size * 2 - 1).bit_length() # At least 2 objects
+        self.pages = [] # List of SlubPage objects (formerly slabs)
+        
+        # Determine appropriate page order from Buddy
+        # Check simple size map
+        # Order 5 (32 units) is our default "Page" for demo
+        self.page_order = 5 
+        if object_size > 16: self.page_order = (object_size * 2 - 1).bit_length()
 
     def allocate(self):
-        # 1. Try to allocate from existing slabs
-        for slab in self.slabs:
-            addr = slab.allocate()
+        # 1. Try to allocate from existing pages (typically "partial" list)
+        for page in self.pages:
+            addr = page.allocate()
             if addr is not None:
-                self.buddy.log(f"[Slab-{self.name}] Allocated object at {addr} (in Slab PFN {slab.pfn})")
+                self.buddy.log(f"[Slub-{self.name}] Allocated object at {addr} (Page PFN {page.pfn})")
                 return addr
         
         # 2. No space? Request new page from Buddy
-        self.buddy.log(f"[Slab-{self.name}] Cache full. Requesting new Page (Order {self.page_order}) from Buddy...")
+        self.buddy.log(f"[Slub-{self.name}] Cache full. Requesting new Page (Order {self.page_order}) from Buddy...")
         buddy_block = self.buddy.allocate(1 << self.page_order, slab_owner=self.name)
         
         if buddy_block:
-            new_slab = Slab(buddy_block.pfn, buddy_block.size, self.object_size)
-            self.slabs.append(new_slab)
-            addr = new_slab.allocate()
-            self.buddy.log(f"[Slab-{self.name}] Created new Slab at {buddy_block.pfn}. Allocated object at {addr}.")
+            new_page = SlubPage(buddy_block.pfn, buddy_block.size, self.object_size)
+            self.pages.append(new_page)
+            addr = new_page.allocate()
+            self.buddy.log(f"[Slub-{self.name}] New Page at {buddy_block.pfn}. Initialized Free List. Allocated {addr}.")
             return addr
         else:
-            self.buddy.log(f"[Slab-{self.name}] Failed to expand cache. Buddy Allocator OOM.")
+            self.buddy.log(f"[Slub-{self.name}] Failed to expand cache. Buddy Allocator OOM.")
             return None
 
     def deallocate(self, address):
-        for slab in self.slabs:
-            if slab.pfn <= address < slab.pfn + slab.size:
-                if slab.deallocate(address):
-                    self.buddy.log(f"[Slab-{self.name}] Freed object at {address}.")
+        for page in self.pages:
+            if page.pfn <= address < page.pfn + page.size:
+                if page.deallocate(address):
+                    self.buddy.log(f"[Slub-{self.name}] Freed object at {address}. Returned to Free List head.")
                     
-                    # Check if slab is empty and return to buddy?
-                    if slab.is_empty():
-                        self.buddy.log(f"[Slab-{self.name}] Slab at {slab.pfn} is empty. Returning to Buddy.")
-                        self.slabs.remove(slab)
-                        self.buddy.deallocate(slab.pfn)
+                    if page.is_empty():
+                        self.buddy.log(f"[Slub-{self.name}] Page at {page.pfn} is empty. Returning to Buddy.")
+                        self.pages.remove(page)
+                        self.buddy.deallocate(page.pfn)
                     return True
         return False
 
@@ -244,14 +263,14 @@ class SlabCache:
         return {
             "name": self.name,
             "object_size": self.object_size,
-            "slabs": [s.to_dict() for s in self.slabs]
+            "pages": [p.to_dict() for p in self.pages]
         }
 
 # Initialize global allocator and default caches
 allocator = BuddyAllocator(TOTAL_MEMORY)
 slab_caches = {
-    "task_struct": SlabCache("task_struct", 4, allocator), # Small objs
-    "inode": SlabCache("inode", 8, allocator)      # Medium objs
+    "task_struct": SlubCache("task_struct", 4, allocator),
+    "inode": SlubCache("inode", 8, allocator)
 }
 
 # --- Web Server ---
@@ -295,11 +314,13 @@ HTML_CONTENT = """
         .slab-cache { border: 1px solid #ccc; padding: 10px; border-radius: 4px; background: #fafafa; }
         .slab-header { font-weight: bold; font-size: 14px; margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center; }
         .slab-pages { display: flex; gap: 10px; flex-wrap: wrap; }
-        .slab-page { border: 1px solid #999; padding: 2px; background: white; width: 140px; }
+        .slab-page { border: 1px solid #999; padding: 2px; background: white; width: 160px; }
         .slab-page-info { font-size: 10px; text-align: center; color: #666; margin-bottom: 2px; }
-        .slab-slots { display: flex; flex-wrap: wrap; gap: 1px; }
-        .slot { width: 12px; height: 12px; background: #90EE90; border: 0.5px solid #ccc; }
-        .slot.used { background: #28a745; }
+        .slab-slots { display: flex; flex-wrap: wrap; gap: 2px; }
+        
+        .slot { width: 30px; height: 18px; background: #90EE90; border: 1px solid #ccc; font-size: 9px; display: flex; align-items: center; justify-content: center; color: #333; overflow: hidden; }
+        .slot.used { background: #28a745; color: white; border-color: #1e7e34; }
+        .slot.head { border: 2px solid #007bff; box-shadow: 0 0 3px #007bff; }
         
         #log-panel { background: #1e1e1e; color: #00ff00; padding: 15px; border-radius: 8px; font-family: 'Consolas', 'Courier New', monospace; height: 600px; overflow-y: auto; font-size: 12px; border: 1px solid #333; }
         .log-entry { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; line-height: 1.4; word-wrap: break-word; }
@@ -311,7 +332,7 @@ HTML_CONTENT = """
 <body>
 
     <h1>Linux Memory Subsystem</h1>
-    <div class="subtitle">Interactions between Buddy System (Pages) and Slab Allocator (Objects)</div>
+    <div class="subtitle">Visualizing Buddy System & Slub Allocator (Modern Default)</div>
 
     <div class="main-layout">
         <div class="left-panel">
@@ -324,14 +345,15 @@ HTML_CONTENT = """
                     <button class="btn-reset" onclick="resetAll()">Reset System</button>
                 </div>
                 <div id="memory-container"></div>
-                <div style="font-size: 11px; margin-top:5px; color:#666">Click Red blocks to free pages. Gold blocks are owned by Slab (Free via Slab controls).</div>
+                <div style="font-size: 11px; margin-top:5px; color:#666">Click Red blocks to free pages. Gold blocks are owned by Slub (Free via Slub controls).</div>
             </div>
 
-            <!-- Slab Allocator Section -->
+            <!-- Slub Allocator Section -->
             <div class="section-box">
-                <h2>2. Slab Allocator (Object Cache)</h2>
+                <h2>2. Slub Allocator (Object Cache)</h2>
                 <div style="font-size: 0.85em; color: #666; margin-bottom: 10px; font-style: italic;">
-                    Note: Object sizes (4, 8) are simplified for visualization. Real Linux `task_struct` is ~4KB+ and `inode` ~600B+.
+                    Note: Shows embedded <b>Free List</b>. Green blocks point to the "Next" free index. <br>
+                    Object sizes are simplified. Real <code>task_struct</code> ~4KB, <code>inode</code> ~600B.
                 </div>
                 <div class="controls">
                     <span><b>task_struct</b> (Size 4):</span>
@@ -357,10 +379,10 @@ HTML_CONTENT = """
             const entry = document.createElement('div');
             entry.className = 'log-entry';
             
-            if(message.includes('[Slab')) entry.classList.add('log-slab');
+            if(message.includes('[Slub')) entry.classList.add('log-slab');
             else if(message.includes('[Buddy')) entry.classList.add('log-buddy');
             
-            entry.innerText = message; // Simple text
+            entry.innerText = message; 
             panel.appendChild(entry);
             panel.scrollTop = panel.scrollHeight;
         }
@@ -394,7 +416,6 @@ HTML_CONTENT = """
                 div.innerHTML = `<span>${block.size}</span>`;
                 div.title = `PFN: ${block.address}, Order: ${block.order}\\n${block.slab_type ? 'Owned by: '+block.slab_type : ''}`;
                 
-                // Only allow direct free if not slab owned (conceptually)
                 if (!block.is_free && !block.slab_type) {
                     div.onclick = () => deallocBuddy(block.address);
                 }
@@ -412,23 +433,35 @@ HTML_CONTENT = """
                 div.className = 'slab-cache';
                 
                 let pagesHtml = '';
-                cache.slabs.forEach(slab => {
+                cache.pages.forEach(page => {
                     let slotsHtml = '';
-                    slab.slots.forEach((isFree, index) => {
-                        const addr = slab.pfn + index * cache.object_size;
-                        const click = isFree ? '' : `onclick="deallocBuddy(${addr})" style="cursor:pointer" title="Free Object ${addr}"`;
-                        slotsHtml += `<div class="slot ${isFree ? '' : 'used'}" ${click}></div>`;
+                    page.slots.forEach((val, index) => {
+                        const addr = page.pfn + index * cache.object_size;
+                        const isUsed = val === -2;
+                        const isHead = index === page.free_head;
+                        
+                        let content = '';
+                        if (isUsed) content = 'USED';
+                        else if (val === -1) content = 'END';
+                        else content = `→ ${val}`; // Pointer to next
+                        
+                        const click = isUsed ? `onclick="deallocBuddy(${addr})" style="cursor:pointer" title="Free Object"` : '';
+                        
+                        slotsHtml += `
+                            <div class="slot ${isUsed ? 'used' : ''} ${isHead ? 'head' : ''}" ${click} title="Index: ${index}, Next: ${val}">
+                                ${content}
+                            </div>`;
                     });
                     
                     pagesHtml += `
                         <div class="slab-page">
-                            <div class="slab-page-info">Page PFN ${slab.pfn}</div>
+                            <div class="slab-page-info">Page PFN ${page.pfn} (Head: ${page.free_head})</div>
                             <div class="slab-slots">${slotsHtml}</div>
                         </div>
                     `;
                 });
                 
-                if (cache.slabs.length === 0) pagesHtml = '<div style="font-size:11px; color:#999; margin:5px;">No Active Pages</div>';
+                if (cache.pages.length === 0) pagesHtml = '<div style="font-size:11px; color:#999; margin:5px;">No Active Pages</div>';
                 
                 div.innerHTML = `
                     <div class="slab-header">
@@ -469,9 +502,8 @@ HTML_CONTENT = """
             else if (data.message) alert(data.message);
         }
 
-        // Initial load
         fetchState();
-        appendLog("[System] Kernel initialized.");
+        appendLog("[System] Kernel initialized (Slub Enabled).");
     </script>
 </body>
 </html>
@@ -512,7 +544,6 @@ class BuddyRequestHandler(http.server.SimpleHTTPRequestHandler):
 
         response = {"success": False, "logs": []}
         
-        # Clear logs before op (except for shared logs issue, but single threaded here so ok)
         allocator.logs = [] 
         
         if self.path == '/allocate':
@@ -523,11 +554,9 @@ class BuddyRequestHandler(http.server.SimpleHTTPRequestHandler):
         
         elif self.path == '/deallocate':
             addr = data.get('address')
-            # Try Buddy First
             if allocator.deallocate(addr):
                 response["success"] = True
             else:
-                # Try Slabs
                 found = False
                 for cache in slab_caches.values():
                     if cache.deallocate(addr):
@@ -535,7 +564,7 @@ class BuddyRequestHandler(http.server.SimpleHTTPRequestHandler):
                         break
                 response["success"] = found
                 if not found:
-                     response["message"] = "Address not found in Buddy or Slab caches"
+                     response["message"] = "Address not found in Buddy or Slub caches"
             
             response["logs"] = allocator.logs
 
@@ -544,15 +573,15 @@ class BuddyRequestHandler(http.server.SimpleHTTPRequestHandler):
             if name in slab_caches:
                 addr = slab_caches[name].allocate()
                 response["success"] = (addr is not None)
-                response["logs"] = allocator.logs # Contains both slab and buddy logs
+                response["logs"] = allocator.logs
             else:
                  response["message"] = "Unknown cache"
 
         elif self.path == '/reset':
             allocator = BuddyAllocator(TOTAL_MEMORY)
             slab_caches = {
-                "task_struct": SlabCache("task_struct", 4, allocator),
-                "inode": SlabCache("inode", 8, allocator)
+                "task_struct": SlubCache("task_struct", 4, allocator),
+                "inode": SlubCache("inode", 8, allocator)
             }
             response["success"] = True
             response["logs"] = ["System Reset."]
