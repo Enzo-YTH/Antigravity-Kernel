@@ -357,7 +357,7 @@ HTML_CONTENT = """
             if(message.includes('[Slab')) entry.classList.add('log-slab');
             else if(message.includes('[Buddy')) entry.classList.add('log-buddy');
             
-            entry.innerText = message; <span></span> // Simple text
+            entry.innerText = message; // Simple text
             panel.appendChild(entry);
             panel.scrollTop = panel.scrollHeight;
         }
@@ -411,8 +411,10 @@ HTML_CONTENT = """
                 let pagesHtml = '';
                 cache.slabs.forEach(slab => {
                     let slotsHtml = '';
-                    slab.slots.forEach(isFree => {
-                        slotsHtml += `<div class="slot ${isFree ? '' : 'used'}"></div>`;
+                    slab.slots.forEach((isFree, index) => {
+                        const addr = slab.pfn + index * cache.object_size;
+                        const click = isFree ? '' : `onclick="deallocBuddy(${addr})" style="cursor:pointer" title="Free Object ${addr}"`;
+                        slotsHtml += `<div class="slot ${isFree ? '' : 'used'}" ${click}></div>`;
                     });
                     
                     pagesHtml += `
@@ -518,7 +520,20 @@ class BuddyRequestHandler(http.server.SimpleHTTPRequestHandler):
         
         elif self.path == '/deallocate':
             addr = data.get('address')
-            response["success"] = allocator.deallocate(addr)
+            # Try Buddy First
+            if allocator.deallocate(addr):
+                response["success"] = True
+            else:
+                # Try Slabs
+                found = False
+                for cache in slab_caches.values():
+                    if cache.deallocate(addr):
+                        found = True
+                        break
+                response["success"] = found
+                if not found:
+                     response["message"] = "Address not found in Buddy or Slab caches"
+            
             response["logs"] = allocator.logs
 
         elif self.path == '/slab_allocate':
