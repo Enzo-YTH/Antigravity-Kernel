@@ -330,6 +330,9 @@ HTML_CONTENT = """
             <!-- Slab Allocator Section -->
             <div class="section-box">
                 <h2>2. Slab Allocator (Object Cache)</h2>
+                <div style="font-size: 0.85em; color: #666; margin-bottom: 10px; font-style: italic;">
+                    Note: Object sizes (4, 8) are simplified for visualization. Real Linux `task_struct` is ~4KB+ and `inode` ~600B+.
+                </div>
                 <div class="controls">
                     <span><b>task_struct</b> (Size 4):</span>
                     <button class="btn-slab" onclick="allocSlab('task_struct')">+ Alloc Object</button>
